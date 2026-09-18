@@ -76,12 +76,11 @@ struct Yue2NAR {
     int                  graph_ar;    // cached ar_len
     int                  graph_set;   // cached KV set
 
-    // Bound adapter, null when none. Part of the graph cache key below: a
-    // different one has to rebuild the velocity graph.
-    const LoraSet * lora             = nullptr;
-    float           lora_scale       = 1.0f;
-    const LoraSet * graph_lora       = nullptr;
-    float           graph_lora_scale = 1.0f;
+    // Bound adapter, null when none. No cache key of its own: nar_build_graph
+    // rebuilds the velocity graph at every evaluation, so it reads whatever is
+    // bound at the time. Only the AR half caches a graph across generates.
+    const LoraSet * lora       = nullptr;
+    float           lora_scale = 1.0f;
 
     std::vector<float>   scratch_x;
     std::vector<float>   scratch_pos_emb;

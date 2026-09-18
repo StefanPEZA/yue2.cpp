@@ -40,19 +40,23 @@ struct Qwen3LMConfig {
 // batch base set hold within a generation. A prefill forward clobbers the
 // shared sched allocation, so it invalidates this cache.
 struct Qw3lmGraphCache {
-    bool                  built        = false;
-    int                   key_n_kv_pad = 0;
-    int                   key_N        = 0;
-    int                   key_row0     = 0;
-    int                   key_rows     = 0;
-    struct ggml_tensor *  key_kv       = nullptr;  // the cache the graph reads, reallocated on growth
-    int                   key_s0       = 0;
-    struct ggml_cgraph *  gf           = nullptr;
-    struct ggml_tensor *  token_ids_t  = nullptr;
-    struct ggml_tensor *  positions    = nullptr;
-    struct ggml_tensor *  kv_rows      = nullptr;
-    struct ggml_tensor *  attn_mask    = nullptr;
-    struct ggml_tensor *  lgt          = nullptr;
+    bool                  built          = false;
+    int                   key_n_kv_pad   = 0;
+    int                   key_N          = 0;
+    int                   key_row0       = 0;
+    int                   key_rows       = 0;
+    struct ggml_tensor *  key_kv         = nullptr;  // the cache the graph reads, reallocated on growth
+    int                   key_s0         = 0;
+    // The bound adapter is baked into the graph: its A/B tensors are nodes and
+    // its strength is a ggml_scale constant, so a rebind has to rebuild.
+    const LoraSet *       key_lora       = nullptr;
+    float                 key_lora_scale = 1.0f;
+    struct ggml_cgraph *  gf             = nullptr;
+    struct ggml_tensor *  token_ids_t    = nullptr;
+    struct ggml_tensor *  positions      = nullptr;
+    struct ggml_tensor *  kv_rows        = nullptr;
+    struct ggml_tensor *  attn_mask      = nullptr;
+    struct ggml_tensor *  lgt            = nullptr;
     StaticGraph           graph;
     std::vector<int>      pos_data;
     std::vector<int64_t>  rows_data;
@@ -716,7 +720,8 @@ static void qw3lm_forward_batch(Qwen3LM *      m,
     const bool need_build = !m->batch_graph.built || m->batch_graph.key_n_kv_pad != n_kv_pad ||
                             m->batch_graph.key_N != N || m->batch_graph.key_s0 != s0 ||
                             m->batch_graph.key_row0 != row0 || m->batch_graph.key_rows != rows ||
-                            m->batch_graph.key_kv != kv->k4[0];
+                            m->batch_graph.key_kv != kv->k4[0] || m->batch_graph.key_lora != m->lora ||
+                            m->batch_graph.key_lora_scale != m->lora_scale;
     if (need_build) {
         static_graph_release(&m->batch_graph.graph, m->sched);
         m->batch_graph.built      = false;
@@ -871,18 +876,20 @@ static void qw3lm_forward_batch(Qwen3LM *      m,
             exit(1);
         }
 
-        m->batch_graph.gf           = gf;
-        m->batch_graph.token_ids_t  = token_ids_t;
-        m->batch_graph.positions    = positions;
-        m->batch_graph.kv_rows      = kv_rows;
-        m->batch_graph.attn_mask    = attn_mask;
-        m->batch_graph.lgt          = lgt;
-        m->batch_graph.key_n_kv_pad = n_kv_pad;
-        m->batch_graph.key_N        = N;
-        m->batch_graph.key_s0       = s0;
-        m->batch_graph.key_row0     = row0;
-        m->batch_graph.key_rows     = rows;
-        m->batch_graph.key_kv       = kv->k4[0];
+        m->batch_graph.gf             = gf;
+        m->batch_graph.token_ids_t    = token_ids_t;
+        m->batch_graph.positions      = positions;
+        m->batch_graph.kv_rows        = kv_rows;
+        m->batch_graph.attn_mask      = attn_mask;
+        m->batch_graph.lgt            = lgt;
+        m->batch_graph.key_n_kv_pad   = n_kv_pad;
+        m->batch_graph.key_N          = N;
+        m->batch_graph.key_s0         = s0;
+        m->batch_graph.key_row0       = row0;
+        m->batch_graph.key_rows       = rows;
+        m->batch_graph.key_kv         = kv->k4[0];
+        m->batch_graph.key_lora       = m->lora;
+        m->batch_graph.key_lora_scale = m->lora_scale;
         m->batch_graph.pos_data.resize((size_t) N);
         m->batch_graph.rows_data.resize((size_t) N);
         m->batch_graph.mask_data.resize((size_t) n_kv_pad * (size_t) N);

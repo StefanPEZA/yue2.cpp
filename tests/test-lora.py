@@ -131,6 +131,29 @@ def main():
     if abs(ratio - 1.0) > args.tol:
         print("FAIL: delta magnitude off by %.2f%%" % (100.0 * abs(ratio - 1.0)))
         return 1
+
+    # The harness rebound the same adapter at half strength and decoded the
+    # same token again, from the same cache at the same position, so every key
+    # of the batched decode graph was unchanged.
+    #
+    # The assertion is exact non-identity, and only that. A cache that ignores
+    # the binding replays the graph it already built and returns the
+    # full-strength logits bit for bit; the engine is deterministic, so any
+    # difference at all means the graph was rebuilt.
+    #
+    # The magnitude is deliberately not asserted. Only the last token is
+    # re-decoded, while the prefilled prefix stays in the cache at full
+    # strength, so the resulting logit delta is not a monotonic function of the
+    # last token's strength - it grows for some target sets and shrinks for
+    # others. Anything stronger than non-identity here would be a guess.
+    half = np.fromfile(os.path.join(args.workdir, "engine_lora.half.bin"), dtype=np.float32)
+    print("half strength: bit-identical %s, delta ratio %.4f"
+          % (np.array_equal(half, eng_adapted),
+             np.linalg.norm(half - eng_base) / max(eng_norm, 1e-12)))
+    if np.array_equal(half, eng_adapted):
+        print("FAIL: rebinding at half strength changed nothing - stale graph cache")
+        return 1
+
     print("PASS")
     return 0
 
