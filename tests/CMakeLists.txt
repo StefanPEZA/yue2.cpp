@@ -30,3 +30,7 @@ target_include_directories(test-draw PRIVATE ${CMAKE_SOURCE_DIR}/src)
 add_executable(test-sheetsage test-sheetsage.cpp)
 target_link_libraries(test-sheetsage PRIVATE yyjson)
 link_ggml_backends(test-sheetsage)
+
+# test-lora-load: adapter GGUF load harness.
+add_executable(test-lora-load test-lora-load.cpp)
+link_ggml_backends(test-lora-load)
