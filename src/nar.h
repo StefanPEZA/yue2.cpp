@@ -182,10 +182,17 @@ static bool nar_load(Yue2NAR * n, const char * gguf_path) {
 // The NAR reads the nar_* weight set of the same layers, so it binds from the
 // same adapter under the nar_ prefix names.
 static void nar_bind_lora(Yue2NAR * n, const LoraSet * set, float scale) {
+    Qwen3Config qc       = {};
+    qc.hidden_size       = n->cfg.hidden_size;
+    qc.intermediate_size = n->cfg.intermediate_size;
+    qc.n_heads           = n->cfg.n_heads;
+    qc.n_kv_heads        = n->cfg.n_kv_heads;
+    qc.head_dim          = n->cfg.head_dim;
+
     for (int i = 0; i < n->cfg.n_layers; i++) {
         char prefix[64];
         snprintf(prefix, sizeof(prefix), "model.layers.%d", i);
-        qwen3_bind_lora_nar(&n->layers[i], set, prefix, scale);
+        qwen3_bind_lora_nar(&n->layers[i], set, prefix, qc, scale);
     }
     n->lora       = set;
     n->lora_scale = scale;

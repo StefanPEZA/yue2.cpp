@@ -221,42 +221,109 @@ static void qwen3_bind_one(LoraDelta * ld, const LoraSet * set, const std::strin
     ld->fused   = false;
 }
 
-// Bind every slot this layer actually loaded. The fused slots stay unbound
-// here; qwen3_bind_lora_fused knows their row geometry.
-static void qwen3_bind_lora(Qwen3Layer * ly, const LoraSet * set, const std::string & prefix, float scale) {
-    if (ly->q_proj) {
-        qwen3_bind_one(&ly->lora_q, set, prefix + ".self_attn.q_proj.weight", scale);
+// Fill a fused delta: one part per constituent, each writing the rows its own
+// projection owns in the fused output. A constituent the adapter does not
+// cover keeps a null pair and emits no nodes at all.
+static void qwen3_bind_fused(LoraDelta *         ld,
+                             const LoraSet *     set,
+                             const std::string * bases,
+                             const int64_t *     rows,
+                             int                 n,
+                             float               scale) {
+    *ld        = {};
+    ld->n      = n;
+    ld->scale  = scale;
+    ld->fused  = true;
+    int64_t at = 0;
+    for (int i = 0; i < n; i++) {
+        ld->part[i] = lora_find(set, bases[i]);
+        ld->row0[i] = at;
+        at += rows[i];
     }
-    if (ly->k_proj) {
-        qwen3_bind_one(&ly->lora_k, set, prefix + ".self_attn.k_proj.weight", scale);
+}
+
+// Bind every slot this layer actually loaded. qwen3_load_layer picks one of
+// three attention layouts and one of two MLP layouts at load time, so the
+// binding reads the same slots to know which one it got.
+static void qwen3_bind_lora(Qwen3Layer *        ly,
+                            const LoraSet *     set,
+                            const std::string & prefix,
+                            const Qwen3Config & c,
+                            float               scale) {
+    const int64_t q_rows  = (int64_t) c.n_heads * c.head_dim;
+    const int64_t kv_rows = (int64_t) c.n_kv_heads * c.head_dim;
+
+    const std::string q = prefix + ".self_attn.q_proj.weight";
+    const std::string k = prefix + ".self_attn.k_proj.weight";
+    const std::string v = prefix + ".self_attn.v_proj.weight";
+
+    if (ly->qkv) {
+        const std::string bases[3] = { q, k, v };
+        const int64_t     rows[3]  = { q_rows, kv_rows, kv_rows };
+        qwen3_bind_fused(&ly->lora_qkv, set, bases, rows, 3, scale);
+    } else if (ly->qk) {
+        const std::string bases[2] = { q, k };
+        const int64_t     rows[2]  = { q_rows, kv_rows };
+        qwen3_bind_fused(&ly->lora_qk, set, bases, rows, 2, scale);
+        qwen3_bind_one(&ly->lora_v, set, v, scale);
+    } else {
+        qwen3_bind_one(&ly->lora_q, set, q, scale);
+        qwen3_bind_one(&ly->lora_k, set, k, scale);
+        qwen3_bind_one(&ly->lora_v, set, v, scale);
     }
-    if (ly->v_proj) {
-        qwen3_bind_one(&ly->lora_v, set, prefix + ".self_attn.v_proj.weight", scale);
-    }
+
     qwen3_bind_one(&ly->lora_o, set, prefix + ".self_attn.o_proj.weight", scale);
-    if (ly->gate_proj) {
-        qwen3_bind_one(&ly->lora_gate, set, prefix + ".mlp.gate_proj.weight", scale);
+
+    const std::string gate = prefix + ".mlp.gate_proj.weight";
+    const std::string up   = prefix + ".mlp.up_proj.weight";
+    if (ly->gate_up) {
+        const std::string bases[2] = { gate, up };
+        const int64_t     rows[2]  = { c.intermediate_size, c.intermediate_size };
+        qwen3_bind_fused(&ly->lora_gate_up, set, bases, rows, 2, scale);
+    } else {
+        qwen3_bind_one(&ly->lora_gate, set, gate, scale);
+        qwen3_bind_one(&ly->lora_up, set, up, scale);
     }
-    if (ly->up_proj) {
-        qwen3_bind_one(&ly->lora_up, set, prefix + ".mlp.up_proj.weight", scale);
-    }
+
     qwen3_bind_one(&ly->lora_down, set, prefix + ".mlp.down_proj.weight", scale);
 }
 
 // The NAR weight set of the same layers. nar_load_layer names its tensors
 // nar_self_attn / nar_mlp, and tries only the fused-or-separate pair, so the
 // qk slot never comes up here.
-static void qwen3_bind_lora_nar(Qwen3Layer * ly, const LoraSet * set, const std::string & prefix, float scale) {
-    if (!ly->qkv) {
-        qwen3_bind_one(&ly->lora_q, set, prefix + ".nar_self_attn.q_proj.weight", scale);
-        qwen3_bind_one(&ly->lora_k, set, prefix + ".nar_self_attn.k_proj.weight", scale);
-        qwen3_bind_one(&ly->lora_v, set, prefix + ".nar_self_attn.v_proj.weight", scale);
+static void qwen3_bind_lora_nar(Qwen3Layer *        ly,
+                                const LoraSet *     set,
+                                const std::string & prefix,
+                                const Qwen3Config & c,
+                                float               scale) {
+    const std::string q = prefix + ".nar_self_attn.q_proj.weight";
+    const std::string k = prefix + ".nar_self_attn.k_proj.weight";
+    const std::string v = prefix + ".nar_self_attn.v_proj.weight";
+
+    if (ly->qkv) {
+        const std::string bases[3] = { q, k, v };
+        const int64_t     rows[3]  = { (int64_t) c.n_heads * c.head_dim, (int64_t) c.n_kv_heads * c.head_dim,
+                                       (int64_t) c.n_kv_heads * c.head_dim };
+        qwen3_bind_fused(&ly->lora_qkv, set, bases, rows, 3, scale);
+    } else {
+        qwen3_bind_one(&ly->lora_q, set, q, scale);
+        qwen3_bind_one(&ly->lora_k, set, k, scale);
+        qwen3_bind_one(&ly->lora_v, set, v, scale);
     }
+
     qwen3_bind_one(&ly->lora_o, set, prefix + ".nar_self_attn.o_proj.weight", scale);
-    if (!ly->gate_up) {
-        qwen3_bind_one(&ly->lora_gate, set, prefix + ".nar_mlp.gate_proj.weight", scale);
-        qwen3_bind_one(&ly->lora_up, set, prefix + ".nar_mlp.up_proj.weight", scale);
+
+    const std::string gate = prefix + ".nar_mlp.gate_proj.weight";
+    const std::string up   = prefix + ".nar_mlp.up_proj.weight";
+    if (ly->gate_up) {
+        const std::string bases[2] = { gate, up };
+        const int64_t     rows[2]  = { c.intermediate_size, c.intermediate_size };
+        qwen3_bind_fused(&ly->lora_gate_up, set, bases, rows, 2, scale);
+    } else {
+        qwen3_bind_one(&ly->lora_gate, set, gate, scale);
+        qwen3_bind_one(&ly->lora_up, set, up, scale);
     }
+
     qwen3_bind_one(&ly->lora_down, set, prefix + ".nar_mlp.down_proj.weight", scale);
 }
 

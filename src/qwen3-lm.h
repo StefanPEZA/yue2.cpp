@@ -377,10 +377,18 @@ static bool qw3lm_load(Qwen3LM * m, const char * gguf_path) {
 // Bind an adapter to every layer of the AR half. Idempotent: rebinding the
 // same set and scale is what require_lm does on a cache hit.
 static void qw3lm_bind_lora(Qwen3LM * m, const LoraSet * set, float scale) {
+    // Only the four shape fields the fused row geometry needs.
+    Qwen3Config qc       = {};
+    qc.hidden_size       = m->cfg.hidden_size;
+    qc.intermediate_size = m->cfg.intermediate_size;
+    qc.n_heads           = m->cfg.n_heads;
+    qc.n_kv_heads        = m->cfg.n_kv_heads;
+    qc.head_dim          = m->cfg.head_dim;
+
     for (int i = 0; i < m->cfg.n_layers; i++) {
         char prefix[64];
         snprintf(prefix, sizeof(prefix), "model.layers.%d", i);
-        qwen3_bind_lora(&m->layers[i], set, prefix, scale);
+        qwen3_bind_lora(&m->layers[i], set, prefix, qc, scale);
     }
     m->lora       = set;
     m->lora_scale = scale;
