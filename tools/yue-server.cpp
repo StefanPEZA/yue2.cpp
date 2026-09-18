@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -117,8 +118,8 @@ static std::string multipart_build_tracks(const std::vector<std::string> & reque
 
     const size_t boundary_len = strlen(MULTIPART_BOUNDARY);
     const size_t per_track    = 2 * strlen(dash) + 2 * boundary_len + strlen(json_head) + 2 * strlen(crlf) +
-                             strlen(audio_head) + strlen(audio_mime) + strlen(head_end);
-    size_t total = strlen(dash) + boundary_len + strlen(close_end);
+                                strlen(audio_head) + strlen(audio_mime) + strlen(head_end);
+    size_t       total        = strlen(dash) + boundary_len + strlen(close_end);
     for (size_t i = 0; i < audio_parts.size(); i++) {
         total += per_track + request_parts[i].size() + audio_parts[i].size();
     }
@@ -418,6 +419,7 @@ static bool         g_keep_loaded = false;
 static std::string  g_model_path;
 static std::string  g_vae_path;
 static std::string  g_transcriber_path;
+static std::string  g_lora_dir;
 
 static void on_signal(int) {
     active_job_cancel();
@@ -453,6 +455,20 @@ static void handle_props(const httplib::Request &, httplib::Response & res) {
     yyjson_mut_obj_add_int(doc, root, "sample_rate", YUE2_SAMPLE_RATE);
     yyjson_mut_obj_add_int(doc, root, "frame_rate", YUE2_FRAME_RATE);
     yyjson_mut_obj_add_int(doc, root, "context", YUE2_CONTEXT);
+
+    // The adapters the engine can actually resolve, so the studio and the
+    // engine cannot disagree about what exists.
+    yyjson_mut_val * loras = yyjson_mut_arr(doc);
+    if (!g_lora_dir.empty()) {
+        std::error_code ec;
+        for (const auto & e : std::filesystem::directory_iterator(g_lora_dir, ec)) {
+            if (e.is_regular_file(ec) && e.path().extension() == ".gguf") {
+                std::string name = e.path().filename().string();
+                yyjson_mut_arr_add_strncpy(doc, loras, name.c_str(), name.size());
+            }
+        }
+    }
+    yyjson_mut_obj_add_val(doc, root, "loras", loras);
 
     // The defaults are the request schema itself, serialized by the request
     // writer and grafted here: one source of truth, one float formatting
@@ -510,6 +526,32 @@ static bool validate(const httplib::Request & req, httplib::Response & res, Yue2
     if (!yue2_sampling_valid(r->abc_sampling, "abc") || !yue2_sampling_valid(r->semantic_sampling, "semantic")) {
         res.status = 400;
         res.set_content(json_string("error", "sampling preset outside the protocol bounds"), "application/json");
+        return false;
+    }
+    if (!r->lora.empty()) {
+        // A bare filename only: the studio never sends filesystem paths, and
+        // the engine must not be talked into reading outside --lora-dir.
+        if (r->lora.find('/') != std::string::npos || r->lora.find('\\') != std::string::npos ||
+            r->lora.find("..") != std::string::npos) {
+            res.status = 400;
+            res.set_content(json_string("error", "lora must be a bare filename"), "application/json");
+            return false;
+        }
+        if (g_lora_dir.empty()) {
+            res.status = 400;
+            res.set_content(json_string("error", "server started without --lora-dir"), "application/json");
+            return false;
+        }
+        std::error_code ec;
+        if (!std::filesystem::exists(std::filesystem::path(g_lora_dir) / r->lora, ec)) {
+            res.status = 400;
+            res.set_content(json_string("error", "unknown lora"), "application/json");
+            return false;
+        }
+    }
+    if (r->lora_scale < 0.0f || r->lora_scale > 4.0f) {
+        res.status = 400;
+        res.set_content(json_string("error", "lora_scale must be between 0 and 4"), "application/json");
         return false;
     }
     request_resolve_seed(r);
@@ -594,6 +636,7 @@ static void print_usage(const char * prog) {
             "\n"
             "Optional:\n"
             "  --transcriber <gguf>   SheetSage2 GGUF, enables /transcribe\n"
+            "  --lora-dir <path>      Directory of LoRA adapters, offered to /synth by name\n"
             "  --host <addr>          Listen address (default: 0.0.0.0)\n"
             "  --port <N>             Listen port (default: 8087)\n"
             "  --max-batch <N>        Song batch limit, one KV set each (default: 1)\n"
@@ -637,6 +680,8 @@ int main(int argc, char ** argv) {
             if (params.max_batch < 1) {
                 params.max_batch = 1;
             }
+        } else if (!strcmp(argv[i], "--lora-dir") && !last) {
+            g_lora_dir = argv[++i];
         } else if (!strcmp(argv[i], "--max-seq") && !last) {
             params.max_seq = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--vae-core") && !last) {
@@ -665,6 +710,7 @@ int main(int argc, char ** argv) {
     // with --keep-loaded (everything accumulates)
     g_pipeline.store            = store_create(g_keep_loaded ? EVICT_NEVER : EVICT_STRICT);
     g_pipeline.transcriber_path = g_transcriber_path;
+    g_pipeline.lora_dir         = g_lora_dir;
     if (!pipeline_configure(&g_pipeline, g_model_path.c_str(), g_vae_path.c_str(), params)) {
         store_free(g_pipeline.store);
         return 1;
