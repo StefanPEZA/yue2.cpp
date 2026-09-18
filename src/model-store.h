@@ -28,6 +28,13 @@
 //       and survives every eviction. That is what lets the two halves of one
 //       GGUF trade places in VRAM around it.
 //
+//   the LoRA adapter is not a module either
+//       Both halves of the backbone read pairs out of the same adapter, so it
+//       cannot live in either coexistence group without the other group's
+//       require evicting it mid generate. It gets its own slot with its own
+//       rule: at most one resident, and requiring a different path replaces
+//       it. Like the cache, it survives the eviction of what it decorates.
+//
 //   invariant held under BOTH policies
 //       Exactly ONE instance per ModelKey for the whole process. Two
 //       requires with the same key return the same pointer.
@@ -53,6 +60,7 @@
 //   store. Adding a second worker requires adding a mutex here first.
 
 #include "bpe.h"
+#include "lora.h"
 #include "nar.h"
 #include "qwen3-lm.h"
 #include "sheetsage.h"
@@ -105,6 +113,15 @@ void store_release(ModelStore * s, void * handle);
 // evicted: the tokenizer travels with the backbone GGUF metadata (a few
 // MB). Returns NULL on load failure.
 BPETokenizer * store_bpe(ModelStore * s, const char * lm_path);
+
+// Adapter accessor. Loads on first require of a path and keeps it resident
+// while the refcount is above zero. Requiring a different path with the
+// current one idle replaces it; requiring one while another is still held is a
+// programming error and aborts. base_path is the backbone the adapter is
+// validated against. Returns NULL on load failure, and for an empty path,
+// which is how "no adapter" travels.
+const LoraSet * store_require_lora(ModelStore * s, const char * lora_path, const char * base_path);
+void            store_release_lora(ModelStore * s, const LoraSet * set);
 
 // Observability: sum of currently resident GPU module weight buffers, and
 // the count of loaded GPU modules.

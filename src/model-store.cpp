@@ -80,6 +80,11 @@ struct ModelStore {
 
     // CPU resident tokenizers, keyed by backbone GGUF path. Small, never evicted.
     std::unordered_map<std::string, CpuEntry> bpe_by_path;
+
+    // The one resident adapter. Not in the gpu map: it belongs to no
+    // coexistence group, see the doctrine in the header.
+    LoraSet * lora          = nullptr;
+    int       lora_refcount = 0;
 };
 
 // Evicts every GPU entry that conflicts with the key we are about to
@@ -167,6 +172,10 @@ void store_free(ModelStore * s) {
     // CPU modules.
     for (auto & kv : s->bpe_by_path) {
         kv.second.deleter(kv.second.ptr);
+    }
+    if (s->lora) {
+        lora_free(s->lora);
+        delete s->lora;
     }
     delete s;
 }
@@ -327,6 +336,48 @@ BPETokenizer * store_bpe(ModelStore * s, const char * lm_path) {
     return bpe;
 }
 
+const LoraSet * store_require_lora(ModelStore * s, const char * lora_path, const char * base_path) {
+    if (!s || !lora_path || !*lora_path) {
+        return nullptr;
+    }
+    if (s->lora && s->lora->path == lora_path) {
+        s->lora_refcount++;
+        return s->lora;
+    }
+    if (s->lora) {
+        if (s->lora_refcount > 0) {
+            fprintf(stderr, "[Store] FATAL: swapping adapter %s (refcount=%d) for %s\n", s->lora->path.c_str(),
+                    s->lora_refcount, lora_path);
+            abort();
+        }
+        fprintf(stderr, "[Store] Evict LoRA %s (%.1f MB)\n", s->lora->path.c_str(),
+                (float) lora_bytes(s->lora) / (1024.0f * 1024.0f));
+        lora_free(s->lora);
+        delete s->lora;
+        s->lora = nullptr;
+    }
+    Timer     t;
+    LoraSet * set = new LoraSet();
+    if (!lora_load(set, lora_path, base_path)) {
+        delete set;
+        return nullptr;
+    }
+    s->lora          = set;
+    s->lora_refcount = 1;
+    fprintf(stderr, "[Store] Load LoRA: %.0f ms, %.1f MB\n", t.ms(), (float) lora_bytes(set) / (1024.0f * 1024.0f));
+    return set;
+}
+
+void store_release_lora(ModelStore * s, const LoraSet * set) {
+    if (!s || !set || s->lora != set) {
+        return;
+    }
+    assert(s->lora_refcount > 0);
+    s->lora_refcount--;
+    // Kept resident at zero: the next generate usually wants the same one, and
+    // requiring a different path is what frees it.
+}
+
 size_t store_vram_bytes(const ModelStore * s) {
     if (!s) {
         return 0;
@@ -335,7 +386,7 @@ size_t store_vram_bytes(const ModelStore * s) {
     for (const auto & kv : s->gpu) {
         total += kv.second.bytes;
     }
-    return total;
+    return total + lora_bytes(s->lora);
 }
 
 int store_gpu_module_count(const ModelStore * s) {
