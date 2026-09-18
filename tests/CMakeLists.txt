@@ -34,3 +34,7 @@ link_ggml_backends(test-sheetsage)
 # test-lora-load: adapter GGUF load harness.
 add_executable(test-lora-load test-lora-load.cpp)
 link_ggml_backends(test-lora-load)
+
+# test-lora: LoRA delta parity harness against the torch reference.
+add_executable(test-lora test-lora.cpp)
+link_ggml_backends(test-lora)

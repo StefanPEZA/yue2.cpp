@@ -76,6 +76,13 @@ struct Yue2NAR {
     int                  graph_ar;    // cached ar_len
     int                  graph_set;   // cached KV set
 
+    // Bound adapter, null when none. Part of the graph cache key below: a
+    // different one has to rebuild the velocity graph.
+    const LoraSet * lora             = nullptr;
+    float           lora_scale       = 1.0f;
+    const LoraSet * graph_lora       = nullptr;
+    float           graph_lora_scale = 1.0f;
+
     std::vector<float>   scratch_x;
     std::vector<float>   scratch_pos_emb;
     std::vector<int32_t> scratch_pos;
@@ -172,6 +179,26 @@ static bool nar_load(Yue2NAR * n, const char * gguf_path) {
     return true;
 }
 
+// The NAR reads the nar_* weight set of the same layers, so it binds from the
+// same adapter under the nar_ prefix names.
+static void nar_bind_lora(Yue2NAR * n, const LoraSet * set, float scale) {
+    for (int i = 0; i < n->cfg.n_layers; i++) {
+        char prefix[64];
+        snprintf(prefix, sizeof(prefix), "model.layers.%d", i);
+        qwen3_bind_lora_nar(&n->layers[i], set, prefix, scale);
+    }
+    n->lora       = set;
+    n->lora_scale = scale;
+}
+
+static void nar_unbind_lora(Yue2NAR * n) {
+    for (int i = 0; i < n->cfg.n_layers; i++) {
+        qwen3_unbind_lora(&n->layers[i]);
+    }
+    n->lora       = nullptr;
+    n->lora_scale = 1.0f;
+}
+
 // Sigmoid of the raw timestep, then the release shift curve
 static float nar_shift_t(const Yue2NAR * n, float raw_t) {
     float s   = n->timestep_shift;
@@ -244,15 +271,15 @@ static struct ggml_tensor * nar_build_attn(struct ggml_context * ctx,
     int                 q_dim  = Nh * D;
     int                 kv_dim = Nkv * D;
     if (ly->qkv) {
-        struct ggml_tensor * qkv = qwen3_linear(ctx, ly->qkv, x);
+        struct ggml_tensor * qkv = qwen3_linear(ctx, ly->qkv, x, &ly->lora_qkv);
         q                        = ggml_cont(ctx, ggml_view_3d(ctx, qkv, q_dim, N, M, qkv->nb[1], qkv->nb[2], 0));
         k = ggml_cont(ctx, ggml_view_3d(ctx, qkv, kv_dim, N, M, qkv->nb[1], qkv->nb[2], (size_t) q_dim * qkv->nb[0]));
         v = ggml_cont(
             ctx, ggml_view_3d(ctx, qkv, kv_dim, N, M, qkv->nb[1], qkv->nb[2], (size_t) (q_dim + kv_dim) * qkv->nb[0]));
     } else {
-        q = qwen3_linear(ctx, ly->q_proj, x);
-        k = qwen3_linear(ctx, ly->k_proj, x);
-        v = qwen3_linear(ctx, ly->v_proj, x);
+        q = qwen3_linear(ctx, ly->q_proj, x, &ly->lora_q);
+        k = qwen3_linear(ctx, ly->k_proj, x, &ly->lora_k);
+        v = qwen3_linear(ctx, ly->v_proj, x, &ly->lora_v);
     }
 
     q = ggml_reshape_4d(ctx, q, D, Nh, N, M);
@@ -300,7 +327,7 @@ static struct ggml_tensor * nar_build_attn(struct ggml_context * ctx,
     }
 
     attn = ggml_reshape_3d(ctx, attn, Nh * D, N, M);
-    return qwen3_linear(ctx, ly->o_proj, attn);
+    return qwen3_linear(ctx, ly->o_proj, attn, &ly->lora_o);
 }
 
 // Build the velocity graph of M variations of a T_lat frame block over the

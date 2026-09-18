@@ -93,6 +93,11 @@ struct Qwen3LM {
     bool                 use_flash_attn;
     bool                 clamp_fp16;  // clamp hidden state on sub-Ampere CUDA (FP16 accumulation overflow)
 
+    // Bound adapter, null when none. Identity and strength are part of the
+    // decode graph cache key: a different one has to rebuild.
+    const LoraSet * lora       = nullptr;
+    float           lora_scale = 1.0f;
+
     // Persistent graph arenas, one per graph shape class: stable node
     // addresses across rebuilds keep the backend graph cache hot.
     GraphArena arena_prefill;
@@ -369,6 +374,26 @@ static bool qw3lm_load(Qwen3LM * m, const char * gguf_path) {
     return true;
 }
 
+// Bind an adapter to every layer of the AR half. Idempotent: rebinding the
+// same set and scale is what require_lm does on a cache hit.
+static void qw3lm_bind_lora(Qwen3LM * m, const LoraSet * set, float scale) {
+    for (int i = 0; i < m->cfg.n_layers; i++) {
+        char prefix[64];
+        snprintf(prefix, sizeof(prefix), "model.layers.%d", i);
+        qwen3_bind_lora(&m->layers[i], set, prefix, scale);
+    }
+    m->lora       = set;
+    m->lora_scale = scale;
+}
+
+static void qw3lm_unbind_lora(Qwen3LM * m) {
+    for (int i = 0; i < m->cfg.n_layers; i++) {
+        qwen3_unbind_lora(&m->layers[i]);
+    }
+    m->lora       = nullptr;
+    m->lora_scale = 1.0f;
+}
+
 // Build self-attention with KV cache write + read. The T fresh K/V rows write
 // at the positions carried by kv_rows via set_rows: destinations travel as
 // data, so the graph topology stays identical across decode steps and the
@@ -399,19 +424,19 @@ static struct ggml_tensor * qw3lm_build_attn(struct ggml_context * ctx,
     int                 q_dim  = Nh * D;
     int                 kv_dim = Nkv * D;
     if (ly->qkv) {
-        struct ggml_tensor * qkv = qwen3_linear(ctx, ly->qkv, x);
+        struct ggml_tensor * qkv = qwen3_linear(ctx, ly->qkv, x, &ly->lora_qkv);
         q                        = ggml_cont(ctx, ggml_view_2d(ctx, qkv, q_dim, S, qkv->nb[1], 0));
         k = ggml_cont(ctx, ggml_view_2d(ctx, qkv, kv_dim, S, qkv->nb[1], (size_t) q_dim * qkv->nb[0]));
         v = ggml_cont(ctx, ggml_view_2d(ctx, qkv, kv_dim, S, qkv->nb[1], (size_t) (q_dim + kv_dim) * qkv->nb[0]));
     } else if (ly->qk) {
-        struct ggml_tensor * qk = qwen3_linear(ctx, ly->qk, x);
+        struct ggml_tensor * qk = qwen3_linear(ctx, ly->qk, x, &ly->lora_qk);
         q                       = ggml_cont(ctx, ggml_view_2d(ctx, qk, q_dim, S, qk->nb[1], 0));
         k = ggml_cont(ctx, ggml_view_2d(ctx, qk, kv_dim, S, qk->nb[1], (size_t) q_dim * qk->nb[0]));
-        v = qwen3_linear(ctx, ly->v_proj, x);
+        v = qwen3_linear(ctx, ly->v_proj, x, &ly->lora_v);
     } else {
-        q = qwen3_linear(ctx, ly->q_proj, x);
-        k = qwen3_linear(ctx, ly->k_proj, x);
-        v = qwen3_linear(ctx, ly->v_proj, x);
+        q = qwen3_linear(ctx, ly->q_proj, x, &ly->lora_q);
+        k = qwen3_linear(ctx, ly->k_proj, x, &ly->lora_k);
+        v = qwen3_linear(ctx, ly->v_proj, x, &ly->lora_v);
     }
 
     // Reshape to heads: [X*D, S] -> [D, X, S]
@@ -471,7 +496,7 @@ static struct ggml_tensor * qw3lm_build_attn(struct ggml_context * ctx,
     attn = ggml_reshape_2d(ctx, attn, Nh * D, S);
 
     // O projection
-    return qwen3_linear(ctx, ly->o_proj, attn);
+    return qwen3_linear(ctx, ly->o_proj, attn, &ly->lora_o);
 }
 
 // Rows [row0, row0 + rows) of the LM head, the vocabulary window a stage
@@ -727,20 +752,20 @@ static void qw3lm_forward_batch(Qwen3LM *      m,
             int                 q_dim  = Nh * D;
             int                 kv_dim = Nkv * D;
             if (ly->qkv) {
-                struct ggml_tensor * qkv = qwen3_linear(ctx, ly->qkv, norm);
+                struct ggml_tensor * qkv = qwen3_linear(ctx, ly->qkv, norm, &ly->lora_qkv);
                 q                        = ggml_cont(ctx, ggml_view_2d(ctx, qkv, q_dim, N, qkv->nb[1], 0));
                 k = ggml_cont(ctx, ggml_view_2d(ctx, qkv, kv_dim, N, qkv->nb[1], (size_t) q_dim * qkv->nb[0]));
                 v = ggml_cont(ctx,
                               ggml_view_2d(ctx, qkv, kv_dim, N, qkv->nb[1], (size_t) (q_dim + kv_dim) * qkv->nb[0]));
             } else if (ly->qk) {
-                struct ggml_tensor * qk = qwen3_linear(ctx, ly->qk, norm);
+                struct ggml_tensor * qk = qwen3_linear(ctx, ly->qk, norm, &ly->lora_qk);
                 q                       = ggml_cont(ctx, ggml_view_2d(ctx, qk, q_dim, N, qk->nb[1], 0));
                 k = ggml_cont(ctx, ggml_view_2d(ctx, qk, kv_dim, N, qk->nb[1], (size_t) q_dim * qk->nb[0]));
-                v = qwen3_linear(ctx, ly->v_proj, norm);
+                v = qwen3_linear(ctx, ly->v_proj, norm, &ly->lora_v);
             } else {
-                q = qwen3_linear(ctx, ly->q_proj, norm);
-                k = qwen3_linear(ctx, ly->k_proj, norm);
-                v = qwen3_linear(ctx, ly->v_proj, norm);
+                q = qwen3_linear(ctx, ly->q_proj, norm, &ly->lora_q);
+                k = qwen3_linear(ctx, ly->k_proj, norm, &ly->lora_k);
+                v = qwen3_linear(ctx, ly->v_proj, norm, &ly->lora_v);
             }
 
             // Reshape to heads: [D, Heads, N]
@@ -811,7 +836,7 @@ static void qw3lm_forward_batch(Qwen3LM *      m,
             struct ggml_tensor * attn_cat = ggml_reshape_2d(ctx, attn_result, Nh * D, N);
 
             // Batched O proj
-            struct ggml_tensor * attn_out = qwen3_linear(ctx, ly->o_proj, attn_cat);
+            struct ggml_tensor * attn_out = qwen3_linear(ctx, ly->o_proj, attn_cat, &ly->lora_o);
             hidden                        = ggml_add(ctx, hidden, attn_out);
             if (m->clamp_fp16) {
                 hidden = ggml_clamp(ctx, hidden, -65504.0f, 65504.0f);
