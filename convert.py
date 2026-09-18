@@ -27,6 +27,7 @@ import sys
 import json
 import struct
 import base64
+import argparse
 import numpy as np
 import gguf
 
@@ -40,6 +41,10 @@ COMPONENTS = {
     "transcriber": "SheetSage2",
 }
 TRANSCRIBER_PARENT = "MERT-v2-FullSong"
+
+# The dtype each component is written in. convert.py never converts a dtype;
+# these name what the checkpoint already holds.
+NATIVE = {"backbone": "BF16", "vae": "F32", "transcriber": "F32"}
 
 def log(tag, msg):
     print("[%s] %s" % (tag, msg), file=sys.stderr, flush=True)
@@ -196,11 +201,10 @@ def add_tiktoken_bpe(w, model_dir, tag):
     log(tag, "tokenizer: %d tokens (%d specials), %d merges, %d unreachable"
         % (len(tokens), len(specials), len(merges), unreachable))
 
-def convert_backbone():
+def convert_backbone(checkpoint_dir, out_path):
     """YuE2-3B/ -> YuE2-3B-BF16.gguf, native BF16, config json and BPE embedded."""
-    model_dir = os.path.join(CHECKPOINT_DIR, COMPONENTS["backbone"])
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    out_path = os.path.join(OUTPUT_DIR, "YuE2-3B-BF16.gguf")
+    model_dir = os.path.join(checkpoint_dir, COMPONENTS["backbone"])
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
 
     with open(os.path.join(model_dir, "config.json"), "r", encoding="utf-8") as f:
         cfg = json.load(f)
@@ -218,11 +222,10 @@ def convert_backbone():
     w.close()
     log("backbone", "wrote %s (%.1f MB)" % (out_path, os.path.getsize(out_path) / 1e6))
 
-def convert_vae():
+def convert_vae(checkpoint_dir, out_path):
     """YuE2-Vae/ -> YuE2-Vae-F32.gguf, native F32, stage names, weight norm raw."""
-    model_dir = os.path.join(CHECKPOINT_DIR, COMPONENTS["vae"])
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    out_path = os.path.join(OUTPUT_DIR, "YuE2-Vae-F32.gguf")
+    model_dir = os.path.join(checkpoint_dir, COMPONENTS["vae"])
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
 
     w = gguf.GGUFWriter(out_path, arch="yue2-vae")
     w.add_name("YuE2 Oobleck VAE")
@@ -290,12 +293,11 @@ def transcriber_tokenizer_json(model_dir, cfg):
     }
     return json.dumps(table, separators=(",", ":")), t.n_tokens
 
-def convert_transcriber():
+def convert_transcriber(checkpoint_dir, out_path):
     """SheetSage2/ + MERT-v2-FullSong/ -> SheetSage2-F32.gguf, adapters merged."""
-    model_dir = os.path.join(CHECKPOINT_DIR, COMPONENTS["transcriber"])
-    parent_dir = os.path.join(CHECKPOINT_DIR, TRANSCRIBER_PARENT)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    out_path = os.path.join(OUTPUT_DIR, "SheetSage2-F32.gguf")
+    model_dir = os.path.join(checkpoint_dir, COMPONENTS["transcriber"])
+    parent_dir = os.path.join(checkpoint_dir, TRANSCRIBER_PARENT)
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
 
     with open(os.path.join(model_dir, "config.json"), "r", encoding="utf-8") as f:
         cfg = json.load(f)
@@ -345,35 +347,59 @@ def convert_transcriber():
     w.close()
     log("transcriber", "wrote %s (%.1f MB)" % (out_path, os.path.getsize(out_path) / 1e6))
 
-def convert(component):
+def convert(component, checkpoint_dir, out_path):
     if component == "backbone":
-        convert_backbone()
-        return
-    if component == "vae":
-        convert_vae()
-        return
-    if component == "transcriber":
-        convert_transcriber()
+        convert_backbone(checkpoint_dir, out_path)
+    elif component == "vae":
+        convert_vae(checkpoint_dir, out_path)
+    elif component == "transcriber":
+        convert_transcriber(checkpoint_dir, out_path)
 
-def main():
-    if not os.path.isdir(CHECKPOINT_DIR):
-        log("GGUF", "checkpoints/ not found")
+def default_outfile(component, output_dir=OUTPUT_DIR):
+    return os.path.join(output_dir, "%s-%s.gguf"
+                        % (COMPONENTS[component], NATIVE[component]))
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(
+        description="Convert the YuE2 checkpoints to GGUF, native dtype byte "
+                    "perfect. With no arguments: every component, from "
+                    "checkpoints/, to models/, skipping what already exists.")
+    p.add_argument("component", nargs="*", default=[], metavar="COMPONENT",
+                   help="backbone, vae, transcriber; all three by default")
+    p.add_argument("--checkpoint-dir", default=CHECKPOINT_DIR,
+                   help="the parent holding YuE2-3B/, YuE2-Vae/, SheetSage2/ "
+                        "and MERT-v2-FullSong/")
+    p.add_argument("--outfile",
+                   help="where to write; one component only, and it overrides "
+                        "the rule that an existing output is left alone")
+    args = p.parse_args(argv)
+    args.component = args.component or list(COMPONENTS)
+    unknown = [c for c in args.component if c not in COMPONENTS]
+    if unknown:
+        p.error("unknown component: %s" % ", ".join(unknown))
+    if args.outfile and len(args.component) != 1:
+        p.error("--outfile takes exactly one component")
+    return args
+
+def main(argv=None):
+    args = parse_args(argv)
+    if not os.path.isdir(args.checkpoint_dir):
+        log("GGUF", "%s not found" % args.checkpoint_dir)
         return 1
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    native = {"backbone": "BF16", "vae": "F32", "transcriber": "F32"}
     converted = 0
-    for comp in COMPONENTS:
-        output_path = os.path.join(OUTPUT_DIR, "%s-%s.gguf" % (COMPONENTS[comp], native[comp]))
-        if os.path.exists(output_path):
-            log("GGUF", "skip %s: %s exists" % (comp, os.path.basename(output_path)))
+    for comp in args.component:
+        # An explicit --outfile is a request to write that path; the caller
+        # that supplied it has already decided about overwriting.
+        out_path = args.outfile or default_outfile(comp)
+        if not args.outfile and os.path.exists(out_path):
+            log("GGUF", "skip %s: %s exists" % (comp, os.path.basename(out_path)))
             converted += 1
             continue
-        convert(comp)
+        convert(comp, args.checkpoint_dir, out_path)
         converted += 1
 
-    log("GGUF", "done: %d model(s) in %s" % (converted, OUTPUT_DIR))
+    log("GGUF", "done: %d model(s)" % converted)
     return 0
 
 if __name__ == "__main__":
