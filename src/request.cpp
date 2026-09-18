@@ -36,6 +36,9 @@ void request_init(Yue2Request * r) {
 
     r->output_format = OUTPUT_FORMAT_MP3;
     r->mp3_bitrate   = 128;
+
+    r->lora       = "";
+    r->lora_scale = 1.0f;
 }
 
 static inline std::string yy_str(yyjson_val * v) {
@@ -162,6 +165,12 @@ static void request_parse_obj(yyjson_val * obj, Yue2Request * r) {
     if ((v = yyjson_obj_get(obj, "mp3_bitrate")) && yyjson_is_int(v)) {
         r->mp3_bitrate = yyjson_get_int(v);
     }
+    if ((v = yyjson_obj_get(obj, "lora")) && yyjson_is_str(v)) {
+        r->lora = yy_str(v);
+    }
+    if ((v = yyjson_obj_get(obj, "lora_scale")) && yyjson_is_num(v)) {
+        r->lora_scale = (float) yyjson_get_num(v);
+    }
 }
 
 bool request_parse_json(Yue2Request * r, const char * json) {
@@ -255,6 +264,12 @@ std::string request_to_json(const Yue2Request * r, bool sparse) {
     }
     if (!sparse || r->mp3_bitrate != d.mp3_bitrate) {
         yyjson_mut_obj_add_int(doc, root, "mp3_bitrate", r->mp3_bitrate);
+    }
+    if (!sparse || r->lora != d.lora) {
+        yyjson_mut_obj_add_strncpy(doc, root, "lora", r->lora.c_str(), r->lora.size());
+    }
+    if (!sparse || r->lora_scale != d.lora_scale) {
+        yyjson_mut_obj_add_real(doc, root, "lora_scale", r->lora_scale);
     }
 
     char *      json = yyjson_mut_write(doc, WRITE_FLAGS, NULL);

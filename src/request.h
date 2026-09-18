@@ -69,6 +69,11 @@ struct Yue2Request {
     // MP3 encoder bitrate in kbps, used when output_format is "mp3".
     // WAV outputs ignore this field.
     int mp3_bitrate;  // 128
+
+    // LoRA adapter: a bare filename resolved against --lora-dir, empty for
+    // none, and the strength its deltas are multiplied by.
+    std::string lora;        // ""
+    float       lora_scale;  // 1.0
 };
 
 // fills every field with its default

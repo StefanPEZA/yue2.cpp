@@ -56,6 +56,12 @@ struct Yue2Pipeline {
     Yue2PipelineParams params;
     DebugDumper        dumper;
 
+    // --lora-dir, and the adapter bound for the current generate. Both halves
+    // bind the same one; null is no adapter.
+    std::string     lora_dir;
+    const LoraSet * lora       = nullptr;
+    float           lora_scale = 1.0f;
+
     // The cache, bound at configure to its config with the context override
     // and to the shared backend, held for the process lifetime
     Qw3lmKvCache kv;
@@ -158,6 +164,11 @@ static Qwen3LM * require_lm(Yue2Pipeline * p) {
     if (m) {
         m->use_flash_attn = m->use_flash_attn && !p->params.no_fa;
         m->clamp_fp16     = p->params.clamp_fp16;
+        if (p->lora) {
+            qw3lm_bind_lora(m, p->lora, p->lora_scale);
+        } else {
+            qw3lm_unbind_lora(m);
+        }
     }
     return m;
 }
@@ -168,6 +179,11 @@ static Yue2NAR * require_nar(Yue2Pipeline * p) {
     if (m) {
         m->use_flash_attn = m->use_flash_attn && !p->params.no_fa;
         m->clamp_fp16     = p->params.clamp_fp16;
+        if (p->lora) {
+            nar_bind_lora(m, p->lora, p->lora_scale);
+        } else {
+            nar_unbind_lora(m);
+        }
     }
     return m;
 }
@@ -241,6 +257,29 @@ static bool pipeline_generate(Yue2Pipeline *          p,
     }
 
     KvScope kv_scope = { p };
+
+    // The adapter is required for the whole generate, before any module is, so
+    // both halves bind the same one. Released at every exit.
+    struct LoraScope {
+        Yue2Pipeline * p;
+
+        ~LoraScope() {
+            store_release_lora(p->store, p->lora);
+            p->lora       = nullptr;
+            p->lora_scale = 1.0f;
+        }
+    } lora_scope = { p };
+
+    if (!r.lora.empty()) {
+        std::string lora_path = p->lora_dir.empty() ? r.lora : p->lora_dir + "/" + r.lora;
+        p->lora               = store_require_lora(p->store, lora_path.c_str(), p->model_path.c_str());
+        if (!p->lora) {
+            fprintf(stderr, "[Pipeline] FATAL: cannot load adapter %s\n", lora_path.c_str());
+            return false;
+        }
+        p->lora_scale = r.lora_scale;
+        fprintf(stderr, "[Pipeline] LoRA %s at %.2f\n", r.lora.c_str(), (double) r.lora_scale);
+    }
 
     BPETokenizer * tok    = store_bpe(p->store, p->model_path.c_str());
     auto           encode = [tok](const std::string & text) {
