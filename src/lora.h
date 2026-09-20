@@ -2,7 +2,8 @@
 // lora.h: LoRA adapter weights for the Qwen3 stacks
 //
 // An adapter GGUF written by convert-lora.py holds one A/B pair per base
-// tensor it targets, named "<base tensor name>.lora_a" and ".lora_b". A
+// tensor it targets, named "<base tensor name>.lora_a" and ".lora_b", and
+// optionally whole substitute weights named "<base tensor name>.full". A
 // LoraSet is that file resident on a backend, looked up by base tensor name.
 //
 // The set is keyed by its own path, not by the module it decorates: the AR
@@ -26,6 +27,10 @@
 
 #define LORA_A_SUFFIX ".lora_a"
 #define LORA_B_SUFFIX ".lora_b"
+// A whole weight the adapter substitutes for the backbone's own. The NAR
+// adapters retrain the VAE/LLM projections outright rather than as a delta,
+// so a pair cannot express them.
+#define LORA_FULL_SUFFIX ".full"
 
 // One delta factorisation. a is [in, r], b is [r, out]: the shapes PEFT
 // already stores, so B(Ax) needs no transpose on either side.
@@ -42,6 +47,7 @@ struct LoraSet {
     ggml_backend_t cpu_backend = nullptr;
 
     std::unordered_map<std::string, LoraPair> pairs;  // keyed by base tensor name
+    std::unordered_map<std::string, struct ggml_tensor *> fulls;  // same key space
 };
 
 static void lora_free(LoraSet * s) {
@@ -50,6 +56,7 @@ static void lora_free(LoraSet * s) {
         backend_release(s->backend, s->cpu_backend);
     }
     s->pairs.clear();
+    s->fulls.clear();
     s->backend     = nullptr;
     s->cpu_backend = nullptr;
     s->rank        = 0;
@@ -67,6 +74,13 @@ static bool lora_check_targets(const LoraSet * s, const char * base_path) {
     for (const auto & kv : s->pairs) {
         if (gguf_find_tensor(base.gguf, kv.first.c_str()) < 0) {
             fprintf(stderr, "[LoRA] FATAL: adapter targets '%s', which %s does not have\n", kv.first.c_str(),
+                    base_path);
+            ok = false;
+        }
+    }
+    for (const auto & kv : s->fulls) {
+        if (gguf_find_tensor(base.gguf, kv.first.c_str()) < 0) {
+            fprintf(stderr, "[LoRA] FATAL: adapter replaces '%s', which %s does not have\n", kv.first.c_str(),
                     base_path);
             ok = false;
         }
@@ -98,21 +112,25 @@ static bool lora_load(LoraSet * s, const char * lora_path, const char * base_pat
     s->rank          = rank_key < 0 ? 0 : (int) gguf_get_val_u32(gf.gguf, rank_key);
 
     for (int64_t i = 0; i < n; i++) {
-        std::string name = gguf_get_tensor_name(gf.gguf, i);
-        bool        is_a = lora_ends_with(name, LORA_A_SUFFIX);
-        bool        is_b = lora_ends_with(name, LORA_B_SUFFIX);
-        if (!is_a && !is_b) {
-            fprintf(stderr, "[LoRA] FATAL: '%s' is neither a lora_a nor a lora_b\n", name.c_str());
+        std::string name    = gguf_get_tensor_name(gf.gguf, i);
+        bool        is_a    = lora_ends_with(name, LORA_A_SUFFIX);
+        bool        is_b    = lora_ends_with(name, LORA_B_SUFFIX);
+        bool        is_full = lora_ends_with(name, LORA_FULL_SUFFIX);
+        if (!is_a && !is_b && !is_full) {
+            fprintf(stderr, "[LoRA] FATAL: '%s' is neither a lora_a, a lora_b nor a full\n", name.c_str());
             gf_close(&gf);
             lora_free(s);
             return false;
         }
-        std::string          base = name.substr(0, name.size() - strlen(is_a ? LORA_A_SUFFIX : LORA_B_SUFFIX));
-        struct ggml_tensor * t    = gf_load_tensor(&s->wctx, gf, name);
+        const char *         suffix = is_a ? LORA_A_SUFFIX : (is_b ? LORA_B_SUFFIX : LORA_FULL_SUFFIX);
+        std::string          base   = name.substr(0, name.size() - strlen(suffix));
+        struct ggml_tensor * t      = gf_load_tensor(&s->wctx, gf, name);
         if (is_a) {
             s->pairs[base].a = t;
-        } else {
+        } else if (is_b) {
             s->pairs[base].b = t;
+        } else {
+            s->fulls[base] = t;
         }
     }
 
@@ -139,7 +157,13 @@ static bool lora_load(LoraSet * s, const char * lora_path, const char * base_pat
     }
     gf_close(&gf);
 
-    fprintf(stderr, "[LoRA] %s: %zu pairs, rank %d\n", lora_path, s->pairs.size(), s->rank);
+    // A merged AR/NAR pairing mixes ranks, so the converter omits the key and
+    // the rank goes unreported rather than being reported wrong.
+    fprintf(stderr, "[LoRA] %s: %zu pairs, %zu replacements", lora_path, s->pairs.size(), s->fulls.size());
+    if (s->rank > 0) {
+        fprintf(stderr, ", rank %d", s->rank);
+    }
+    fprintf(stderr, "\n");
     return true;
 }
 
@@ -151,6 +175,15 @@ static LoraPair lora_find(const LoraSet * s, const std::string & base_name) {
     }
     auto it = s->pairs.find(base_name);
     return it == s->pairs.end() ? LoraPair{} : it->second;
+}
+
+// The adapter's substitute for a backbone weight, null when it has none.
+static struct ggml_tensor * lora_find_full(const LoraSet * s, const std::string & base_name) {
+    if (!s) {
+        return nullptr;
+    }
+    auto it = s->fulls.find(base_name);
+    return it == s->fulls.end() ? nullptr : it->second;
 }
 
 static size_t lora_bytes(const LoraSet * s) {

@@ -273,6 +273,110 @@ def test_bare_key_outside_the_layer_list_is_rejected(tmp_path):
         convert_lora.convert_lora(src, str(tmp_path / "out.gguf"))
 
 
+def bare_pair(tmp_path, name, block, rank=4, metadata=None):
+    """A one-pair bare adapter over layer 0 of `block`, written to `name`."""
+    src = str(tmp_path / name)
+    write_safetensors(src, {
+        "layers.0.%s.q_proj.lora_A" % block: np.zeros((rank, 8), dtype=np.float32),
+        "layers.0.%s.q_proj.lora_B" % block: np.zeros((8, rank), dtype=np.float32),
+    }, metadata=metadata)
+    return src
+
+
+def test_two_sources_merge_into_one_gguf(tmp_path):
+    ar = bare_pair(tmp_path, "ar.safetensors", "self_attn")
+    nar = bare_pair(tmp_path, "nar.safetensors", "nar_self_attn")
+    out = str(tmp_path / "merged.gguf")
+    convert_lora.convert_lora([ar, nar], out)
+
+    tensors, _ = read_gguf(out)
+    assert "model.layers.0.self_attn.q_proj.weight.lora_a" in tensors
+    assert "model.layers.0.nar_self_attn.q_proj.weight.lora_b" in tensors
+
+
+def test_two_sources_targeting_the_same_tensor_are_rejected(tmp_path):
+    one = bare_pair(tmp_path, "one.safetensors", "self_attn")
+    two = bare_pair(tmp_path, "two.safetensors", "self_attn")
+    with pytest.raises(SystemExit, match="both target"):
+        convert_lora.convert_lora([one, two], str(tmp_path / "out.gguf"))
+
+
+def test_merged_rank_is_recorded_only_when_the_sources_agree(tmp_path):
+    ar = bare_pair(tmp_path, "ar.safetensors", "self_attn", rank=4)
+    nar = bare_pair(tmp_path, "nar.safetensors", "nar_self_attn", rank=2)
+    same = str(tmp_path / "same.gguf")
+    convert_lora.convert_lora([ar, bare_pair(tmp_path, "b.safetensors", "nar_self_attn", rank=4)], same)
+    _, reader = read_gguf(same)
+    assert reader.get_field("yue2-lora.rank").parts[-1][0] == 4
+
+    mixed = str(tmp_path / "mixed.gguf")
+    convert_lora.convert_lora([ar, nar], mixed)
+    _, reader = read_gguf(mixed)
+    # Advisory only; lora.h reads a missing key as 0 and drops it from the log.
+    assert reader.get_field("yue2-lora.rank") is None
+
+
+def test_full_replacement_weights_are_carried_through(tmp_path):
+    src = str(tmp_path / "nar.safetensors")
+    write_safetensors(src, {
+        "layers.0.nar_self_attn.q_proj.lora_A": np.zeros((4, 8), dtype=np.float32),
+        "layers.0.nar_self_attn.q_proj.lora_B": np.zeros((8, 4), dtype=np.float32),
+        "vae2llm.weight": np.full((16, 4), 3.0, dtype=np.float32),
+        "vae2llm.bias": np.full((16,), 5.0, dtype=np.float32),
+    })
+    out = str(tmp_path / "out.gguf")
+    convert_lora.convert_lora(src, out, dtype="f32")
+
+    tensors, _ = read_gguf(out)
+    assert np.allclose(np.array(tensors["vae2llm.weight.full"].data), 3.0)
+    assert np.allclose(np.array(tensors["vae2llm.bias.full"].data), 5.0)
+
+
+def test_full_replacement_is_not_scaled_by_alpha(tmp_path):
+    """alpha/r folds into lora_b only. A replacement weight is not a delta."""
+    src = str(tmp_path / "nar.safetensors")
+    write_safetensors(src, {
+        "layers.0.nar_self_attn.q_proj.lora_A": np.ones((4, 8), dtype=np.float32),
+        "layers.0.nar_self_attn.q_proj.lora_B": np.ones((8, 4), dtype=np.float32),
+        "llm2vae.bias": np.ones((16,), dtype=np.float32),
+    }, metadata={"lora_alpha": "8"})
+    out = str(tmp_path / "out.gguf")
+    convert_lora.convert_lora(src, out, dtype="f32")
+
+    tensors, _ = read_gguf(out)
+    assert np.allclose(np.array(tensors["model.layers.0.nar_self_attn.q_proj.weight.lora_b"].data), 2.0)
+    assert np.allclose(np.array(tensors["llm2vae.bias.full"].data), 1.0)
+
+
+def test_unknown_full_weight_is_rejected(tmp_path):
+    src = str(tmp_path / "nar.safetensors")
+    write_safetensors(src, {
+        "layers.0.nar_self_attn.q_proj.lora_A": np.zeros((4, 8), dtype=np.float32),
+        "layers.0.nar_self_attn.q_proj.lora_B": np.zeros((8, 4), dtype=np.float32),
+        "model.norm.weight": np.zeros((16,), dtype=np.float32),
+    })
+    with pytest.raises(SystemExit, match="unexpected key"):
+        convert_lora.convert_lora(src, str(tmp_path / "out.gguf"))
+
+
+def test_non_f32_input_names_the_dtype(tmp_path):
+    """A bf16 adapter must say so, not die inside numpy's reshape."""
+    src = str(tmp_path / "bf16.safetensors")
+    header = {
+        "layers.0.self_attn.q_proj.lora_A": {
+            "dtype": "BF16", "shape": [4, 8], "data_offsets": [0, 64]},
+        "layers.0.self_attn.q_proj.lora_B": {
+            "dtype": "BF16", "shape": [8, 4], "data_offsets": [64, 128]},
+    }
+    raw = json.dumps(header).encode()
+    with open(src, "wb") as f:
+        f.write(struct.pack("<Q", len(raw)))
+        f.write(raw)
+        f.write(b"\0" * 128)
+    with pytest.raises(SystemExit, match="BF16"):
+        convert_lora.convert_lora(src, str(tmp_path / "out.gguf"))
+
+
 def test_bare_head_target_is_rejected(tmp_path):
     src = str(tmp_path / "bare.safetensors")
     write_safetensors(src, {

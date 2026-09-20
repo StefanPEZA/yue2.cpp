@@ -32,6 +32,7 @@ import sys
 import json
 import struct
 import argparse
+import collections
 import numpy as np
 import gguf
 
@@ -54,6 +55,13 @@ BARE_B_SUFFIX = ".lora_B"
 # Targets the engine cannot apply a delta to. The LM head is read through a
 # row window (qw3lm_head_rows), so a delta on it needs its own design.
 REJECTED_TARGETS = ("embed_tokens", "lm_head")
+
+# Weights an adapter may replace outright rather than decorate with a delta.
+# The NAR-branch adapters retrain the VAE/LLM projections whole, and ship them
+# beside the pairs. Deliberately a whitelist: a replacement the engine has no
+# override path for must still fail as an unexpected key.
+FULL_WEIGHTS = ("vae2llm.weight", "vae2llm.bias", "llm2vae.weight", "llm2vae.bias")
+FULL_SUFFIX = ".full"
 
 def base_name(peft_key):
     """PEFT key -> engine base tensor name, or None if it is not an A/B key."""
@@ -92,13 +100,16 @@ def bare_base_name(key):
     return None
 
 def group_pairs(meta, to_base, a_suffix):
-    """A/B keys grouped by the base tensor they target.
+    """A/B keys grouped by the base tensor they target, plus whole-weight keys.
 
     Everything the engine has no delta path for is rejected here, before a single
     byte of tensor data is read.
     """
-    pairs = {}
+    pairs, fulls = {}, {}
     for key in sorted(meta):
+        if key in FULL_WEIGHTS:
+            fulls[key] = key
+            continue
         base = to_base(key)
         if base is None:
             raise SystemExit("unexpected key in adapter: %s" % key)
@@ -116,7 +127,7 @@ def group_pairs(meta, to_base, a_suffix):
             raise SystemExit("%s has a lora_B without a lora_A" % base)
         if "b" not in slots:
             raise SystemExit("%s has a lora_A without a lora_B" % base)
-    return pairs
+    return pairs, fulls
 
 def check_config(cfg):
     if cfg.get("use_dora"):
@@ -134,8 +145,10 @@ def scaling(cfg):
         raise SystemExit("adapter_config.json has a non-positive r")
     return (alpha / np.sqrt(r)) if cfg.get("use_rslora") else (alpha / r), r
 
+Adapter = collections.namedtuple(
+    "Adapter", "src sf_path meta data_start pairs fulls scale rank")
+
 def peft_adapter(adapter_dir):
-    """PEFT directory -> (sf_path, meta, data_start, pairs, scale, rank)."""
     cfg_path = os.path.join(adapter_dir, "adapter_config.json")
     with open(cfg_path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
@@ -146,7 +159,8 @@ def peft_adapter(adapter_dir):
     if not os.path.exists(sf_path):
         raise SystemExit("no adapter_model.safetensors in %s" % adapter_dir)
     meta, data_start = read_sf_header(sf_path)
-    return sf_path, meta, data_start, group_pairs(meta, base_name, A_SUFFIX), scale, rank
+    pairs, fulls = group_pairs(meta, base_name, A_SUFFIX)
+    return Adapter(adapter_dir, sf_path, meta, data_start, pairs, fulls, scale, rank)
 
 def md_flag(md, key):
     """A metadata flag. Values are always strings here, so "false" must not read as true."""
@@ -160,12 +174,11 @@ def read_sf_metadata(path):
     return header.get("__metadata__") or {}
 
 def bare_adapter(sf_path):
-    """Bare adapter file -> (sf_path, meta, data_start, pairs, scale, rank)."""
     meta, data_start = read_sf_header(sf_path)
     if any(key.startswith(PEFT_PREFIX) for key in meta):
         raise SystemExit("%s is a PEFT adapter; point at its directory instead, so "
                          "adapter_config.json is read with it" % sf_path)
-    pairs = group_pairs(meta, bare_base_name, BARE_A_SUFFIX)
+    pairs, fulls = group_pairs(meta, bare_base_name, BARE_A_SUFFIX)
     # A is (r, in), so the tensors state the rank with no config to consult.
     rank = int(meta[pairs[min(pairs)]["a"]]["shape"][0])
 
@@ -185,56 +198,109 @@ def bare_adapter(sf_path):
     else:
         scale, _ = scaling({"r": rank, "lora_alpha": alpha,
                             "use_rslora": md_flag(md, "use_rslora")})
-    return sf_path, meta, data_start, pairs, scale, rank
+    return Adapter(sf_path, sf_path, meta, data_start, pairs, fulls, scale, rank)
+
+def read_adapter(src):
+    return (peft_adapter if os.path.isdir(src) else bare_adapter)(src)
+
+def read_tensor(f, ad, key):
+    """One tensor out of the adapter, F32 only.
+
+    convert.py names the dtype it cannot handle; without the same check here a
+    BF16 adapter - what most exporters write - dies inside numpy's reshape.
+    """
+    t = ad.meta[key]
+    if t["dtype"] != "F32":
+        raise SystemExit("unexpected dtype %s for %s in %s"
+                         % (t["dtype"], key, ad.sf_path))
+    f.seek(ad.data_start + t["data_offsets"][0])
+    raw = f.read(t["data_offsets"][1] - t["data_offsets"][0])
+    return np.frombuffer(raw, dtype=np.float32).reshape(t["shape"])
+
+def merge_targets(adapters):
+    """Every base tensor the adapters write, rejecting any two that collide.
+
+    Last-wins would silently drop half of one adapter, which is exactly the
+    quiet half-application the engine's load-time target check exists to stop.
+    """
+    seen = {}
+    for ad in adapters:
+        for name in list(ad.pairs) + list(ad.fulls):
+            if name in seen:
+                raise SystemExit("%s and %s both target %s"
+                                 % (adapter_stem(seen[name]), adapter_stem(ad.src), name))
+            seen[name] = ad.src
+    return seen
 
 def convert_lora(src, out_path, dtype="f16"):
-    """A PEFT directory or a bare adapter file -> out_path, A/B keyed by base name."""
+    """One or more PEFT directories / bare adapter files -> out_path.
+
+    Several sources merge into one GGUF: the AR and NAR halves of a pairing are
+    bound from a single LoraSet, so the engine needs them in a single file.
+    """
     np_type, raw_type = DTYPES[dtype]
-    read = peft_adapter if os.path.isdir(src) else bare_adapter
-    sf_path, meta, data_start, pairs, scale, rank = read(src)
+    sources = [src] if isinstance(src, str) else list(src)
+    adapters = [read_adapter(s) for s in sources]
+    merge_targets(adapters)
 
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     w = gguf.GGUFWriter(out_path, arch="yue2-lora")
-    w.add_name(adapter_stem(src))
-    w.add_uint32("yue2-lora.rank", rank)
+    w.add_name("+".join(adapter_stem(s) for s in sources))
+    # Advisory, and only meaningful when the sources agree - a merged AR/NAR
+    # pairing routinely mixes ranks. lora.h reads a missing key as 0.
+    ranks = {ad.rank for ad in adapters}
+    if len(ranks) == 1:
+        w.add_uint32("yue2-lora.rank", ranks.pop())
 
-    with open(sf_path, "rb") as f:
-        for base in sorted(pairs):
-            slots = pairs[base]
-            for slot in ("a", "b"):
-                t = meta[slots[slot]]
-                f.seek(data_start + t["data_offsets"][0])
-                raw = f.read(t["data_offsets"][1] - t["data_offsets"][0])
-                arr = np.frombuffer(raw, dtype=np.float32).reshape(t["shape"])
-                # The strength lives in B so the engine multiplies once.
-                if slot == "b":
-                    arr = arr * scale
-                w.add_tensor("%s.lora_%s" % (base, slot),
+    n_pairs = n_fulls = 0
+    for ad in adapters:
+        with open(ad.sf_path, "rb") as f:
+            for base in sorted(ad.pairs):
+                for slot in ("a", "b"):
+                    arr = read_tensor(f, ad, ad.pairs[base][slot])
+                    # The strength lives in B so the engine multiplies once.
+                    if slot == "b":
+                        arr = arr * ad.scale
+                    w.add_tensor("%s.lora_%s" % (base, slot),
+                                 np.ascontiguousarray(arr, dtype=np_type),
+                                 raw_dtype=raw_type)
+                n_pairs += 1
+            # A replacement weight is not a delta: alpha/r does not apply to it.
+            for base in sorted(ad.fulls):
+                arr = read_tensor(f, ad, ad.fulls[base])
+                w.add_tensor(base + FULL_SUFFIX,
                              np.ascontiguousarray(arr, dtype=np_type),
                              raw_dtype=raw_type)
+                n_fulls += 1
 
     w.write_header_to_file()
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
     w.close()
-    log("lora", "wrote %s (%d pairs, r=%d, scale=%.4f, %s)"
-        % (out_path, len(pairs), rank, scale, dtype))
+    log("lora", "wrote %s (%d pairs, %d replacements, r=%s, %s)"
+        % (out_path, n_pairs, n_fulls,
+           ",".join(str(ad.rank) for ad in adapters), dtype))
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="Convert a LoRA adapter for the YuE2 backbone to GGUF.")
-    p.add_argument("adapter",
+    p.add_argument("adapter", nargs="+",
                    help="a PEFT directory holding adapter_config.json and "
-                        "adapter_model.safetensors, or a bare adapter .safetensors")
+                        "adapter_model.safetensors, or a bare adapter .safetensors. "
+                        "Several merge into one GGUF, which is how an AR and a NAR "
+                        "adapter are applied together")
     p.add_argument("--outfile",
-                   help="where to write; the adapter's own name with .gguf by default")
+                   help="where to write; the adapter's own name with .gguf by "
+                        "default, required when merging")
     p.add_argument("--dtype", choices=sorted(DTYPES), default="f16",
                    help="tensor type to emit (default f16)")
     return p.parse_args(argv)
 
 def main(argv=None):
     args = parse_args(argv)
-    out = args.outfile or default_outfile(args.adapter)
+    if not args.outfile and len(args.adapter) > 1:
+        raise SystemExit("--outfile is required when merging several adapters")
+    out = args.outfile or default_outfile(args.adapter[0])
     convert_lora(args.adapter, out, args.dtype)
     return 0
 

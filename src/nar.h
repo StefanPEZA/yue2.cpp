@@ -252,6 +252,30 @@ static struct ggml_tensor * nar_linear_bias(struct ggml_context * ctx,
     return ggml_add(ctx, ggml_mul_mat(ctx, w, x), b);
 }
 
+// The adapter's substitute for one backbone weight, faded in by strength.
+//
+// A replacement is a whole weight, not a delta, so the strength cannot simply
+// multiply it the way qwen3_linear multiplies B(Ax). Interpolating keeps both
+// ends of the slider exact - 0 is the backbone's own weight, 1 the adapter's -
+// and both of those are a pointer, not a node. Only a strength in between
+// builds anything, and then on a tensor two orders of magnitude smaller than
+// the layer stack it feeds.
+static struct ggml_tensor * nar_io_weight(struct ggml_context * ctx,
+                                          struct ggml_tensor *  base,
+                                          const LoraSet *       set,
+                                          const char *          name,
+                                          float                 scale) {
+    struct ggml_tensor * full = lora_find_full(set, name);
+    if (!full || scale == 0.0f) {
+        return base;
+    }
+    if (scale == 1.0f) {
+        return full;
+    }
+    struct ggml_tensor * b32 = qwen3_f32(ctx, base);
+    return ggml_add(ctx, b32, ggml_scale(ctx, ggml_sub(ctx, qwen3_f32(ctx, full), b32), scale));
+}
+
 // NAR attention: fresh Q/K/V for the latent block of every variation,
 // concatenated with the AR prefix window of the cache, which every variation
 // reads. The graph only reads the cache, so there is no write to order against
@@ -394,7 +418,9 @@ static bool nar_build_graph(Yue2NAR * n, const Qw3lmKvCache * kv, int T_lat, int
 
     // Latent projection, shared timestep embedding, frame embedding, the last
     // two broadcast over the variations
-    struct ggml_tensor * hidden = nar_linear_bias(ctx, n->vae2llm_w, n->vae2llm_b, n->in_x);
+    struct ggml_tensor * v2l_w  = nar_io_weight(ctx, n->vae2llm_w, n->lora, "vae2llm.weight", n->lora_scale);
+    struct ggml_tensor * v2l_b  = nar_io_weight(ctx, n->vae2llm_b, n->lora, "vae2llm.bias", n->lora_scale);
+    struct ggml_tensor * hidden = nar_linear_bias(ctx, v2l_w, v2l_b, n->in_x);
     struct ggml_tensor * temb   = nar_linear_bias(ctx, n->time_w0, n->time_b0, n->in_time);
     temb                        = nar_linear_bias(ctx, n->time_w1, n->time_b1, ggml_silu(ctx, temb));
     ggml_set_name(temb, "temb_t");
@@ -437,7 +463,9 @@ static bool nar_build_graph(Yue2NAR * n, const Qw3lmKvCache * kv, int T_lat, int
 
     // Velocity head, then drop the LATENT_START and LATENT_END columns of
     // every variation
-    struct ggml_tensor * pred = nar_linear_bias(ctx, n->llm2vae_w, n->llm2vae_b, hidden);
+    struct ggml_tensor * l2v_w = nar_io_weight(ctx, n->llm2vae_w, n->lora, "llm2vae.weight", n->lora_scale);
+    struct ggml_tensor * l2v_b = nar_io_weight(ctx, n->llm2vae_b, n->lora, "llm2vae.bias", n->lora_scale);
+    struct ggml_tensor * pred  = nar_linear_bias(ctx, l2v_w, l2v_b, hidden);
     n->out_v = ggml_cont(ctx, ggml_view_3d(ctx, pred, n->latent_dim, T_lat, M, pred->nb[1], pred->nb[2], pred->nb[1]));
     ggml_set_name(n->out_v, "nar_velocity");
     ggml_set_output(n->out_v);

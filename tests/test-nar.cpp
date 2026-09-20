@@ -25,22 +25,37 @@ static bool read_all(const char * path, void * dst, size_t bytes) {
 }
 
 int main(int argc, char ** argv) {
-    if (argc != 9 && !(argc == 10 && strcmp(argv[9], "--clamp-fp16") == 0)) {
-        fprintf(stderr,
-                "usage: %s backbone.gguf ar_ids.bin x_t.bin T_lat M velocity raw_t out.bin [--clamp-fp16]\n"
-                "       %s backbone.gguf ar_ids.bin x_t.bin T_lat M solve steps out.bin [--clamp-fp16]\n",
-                argv[0], argv[0]);
+    const char * usage = "usage: %s backbone.gguf ar_ids.bin x_t.bin T_lat M velocity raw_t out.bin"
+                         " [--clamp-fp16] [--lora adapter.gguf scale]\n"
+                         "       %s backbone.gguf ar_ids.bin x_t.bin T_lat M solve steps out.bin"
+                         " [--clamp-fp16] [--lora adapter.gguf scale]\n";
+    if (argc < 9) {
+        fprintf(stderr, usage, argv[0], argv[0]);
         return 1;
     }
 
-    const char * gguf_path = argv[1];
-    const char * ids_path  = argv[2];
-    const char * xt_path   = argv[3];
-    int          T_lat     = atoi(argv[4]);
-    int          M         = atoi(argv[5]);
-    const char * mode      = argv[6];
-    const char * out_path  = argv[8];
-    bool         clamp     = argc == 10;
+    const char * gguf_path   = argv[1];
+    const char * ids_path    = argv[2];
+    const char * xt_path     = argv[3];
+    int          T_lat       = atoi(argv[4]);
+    int          M           = atoi(argv[5]);
+    const char * mode        = argv[6];
+    const char * out_path    = argv[8];
+    bool         clamp       = false;
+    const char * lora_path   = nullptr;
+    float        lora_scale  = 1.0f;
+
+    for (int i = 9; i < argc; i++) {
+        if (!strcmp(argv[i], "--clamp-fp16")) {
+            clamp = true;
+        } else if (!strcmp(argv[i], "--lora") && i + 2 < argc) {
+            lora_path  = argv[++i];
+            lora_scale = (float) atof(argv[++i]);
+        } else {
+            fprintf(stderr, usage, argv[0], argv[0]);
+            return 1;
+        }
+    }
 
     bool solve = strcmp(mode, "solve") == 0;
     if (!solve && strcmp(mode, "velocity") != 0) {
@@ -91,6 +106,16 @@ int main(int argc, char ** argv) {
     }
     nar.clamp_fp16 = clamp;
 
+    LoraSet set;
+    if (lora_path) {
+        if (!lora_load(&set, lora_path, gguf_path)) {
+            nar_free(&nar);
+            qw3lm_free(&lm);
+            return 1;
+        }
+        nar_bind_lora(&nar, &set, lora_scale);
+    }
+
     std::vector<float> x_t((size_t) nar.latent_dim * T_lat * M);
     if (!read_all(xt_path, x_t.data(), x_t.size() * sizeof(float))) {
         nar_free(&nar);
@@ -127,6 +152,10 @@ int main(int argc, char ** argv) {
     }
     fclose(out);
 
+    if (lora_path) {
+        nar_unbind_lora(&nar);
+        lora_free(&set);
+    }
     nar_free(&nar);
     qw3lm_kv_free(&kv);
     qw3lm_free(&lm);
